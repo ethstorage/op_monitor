@@ -229,6 +229,10 @@ func (s *Service) promoteLastCandidate() {
 		s.lastSyncStatus = s.lastSyncStatusCandidate
 		s.lastSyncStatusCandidate = nil
 	}
+	if s.lastUnsafeTimeCandidate != nil {
+		s.lastUnsafeTime = s.lastUnsafeTimeCandidate
+		s.lastUnsafeTimeCandidate = nil
+	}
 }
 
 func (s *Service) alert(m string) {
