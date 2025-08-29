@@ -32,7 +32,7 @@ type Service struct {
 	shutdownCancel context.CancelFunc
 	cfg            *Config
 
-	lastAlertTime           *time.Time
+	lastEmailTime           *time.Time
 	lastSyncStatus          *eth.SyncStatus
 	lastUnsafeTime          *time.Time
 	lastSyncStatusCandidate *eth.SyncStatus
@@ -40,9 +40,11 @@ type Service struct {
 }
 
 func ServiceFromCLIConfig(ctx context.Context, cfg *Config, logger log.Logger) (*Service, error) {
+	now := time.Now()
 	s := &Service{
-		logger: logger,
-		cfg:    cfg,
+		logger:        logger,
+		cfg:           cfg,
+		lastEmailTime: &now, // assume email was sent just now on startup, to support liveness email
 	}
 	if err := s.initFromCLIConfig(ctx, cfg); err != nil {
 		return nil, errors.Join(err, s.Stop(ctx)) // try to clean up our failed initialization attempt
@@ -119,8 +121,10 @@ func (s *Service) monitor() {
 	alertMsg := s.monitorBalance()
 	alertMsg = append(alertMsg, s.monitorHeight()...)
 	if len(alertMsg) > 0 {
-		s.alert(strings.Join(alertMsg, "<br />"))
+		s.sendEmail(strings.Join(alertMsg, "<br />"), "Alert")
 		s.promoteLastCandidate()
+	} else {
+		s.sendLivenessEmail()
 	}
 }
 
@@ -235,8 +239,14 @@ func (s *Service) promoteLastCandidate() {
 	}
 }
 
-func (s *Service) alert(m string) {
-	if s.lastAlertTime != nil && time.Since(*s.lastAlertTime) < 5*time.Minute {
+func (s *Service) sendLivenessEmail() {
+	if time.Since(*s.lastEmailTime) > time.Hour*24 {
+		s.sendEmail("op_monitor is running", "Liveness")
+	}
+}
+
+func (s *Service) sendEmail(body, subject string) {
+	if time.Since(*s.lastEmailTime) < 5*time.Minute {
 		s.logger.Warn("Alert suppressed within 5 minutes")
 		return
 	}
@@ -249,8 +259,8 @@ func (s *Service) alert(m string) {
 		msg := gomail.NewMessage()
 		msg.SetHeader("From", emailConfig.From)
 		msg.SetHeader("To", to)
-		msg.SetHeader("Subject", "Alert")
-		msg.SetBody("text/plain", m)
+		msg.SetHeader("Subject", subject)
+		msg.SetBody("text/plain", body)
 
 		if err := d.DialAndSend(msg); err != nil {
 			allGood = false
@@ -262,7 +272,7 @@ func (s *Service) alert(m string) {
 
 	if allGood {
 		now := time.Now()
-		s.lastAlertTime = &now
+		s.lastEmailTime = &now
 	}
 }
 

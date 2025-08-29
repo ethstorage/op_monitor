@@ -10,7 +10,7 @@ monitor list:
 - [ ] transactions from op-batcher/op-proposer doesn't fail
 
 
-When alarm is needed, an email is sent.
+If an alarm is triggered, an email is sent immediately. Otherwise, if no alarm occurs within 24 hours, a liveness email is sent.
 
 # Usage 
 
