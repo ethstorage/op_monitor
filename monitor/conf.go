@@ -16,11 +16,12 @@ type Config struct {
 	Batcher             common.Address
 	Proposer            common.Address
 	Challenger          common.Address
-	L1RPC               string  `json:"l1_rpc"`
-	L2ELRPC             string  `json:"l2_el_rpc"`
-	L2CLRPC             string  `json:"l2_cl_rpc"`
-	MinBalance          float64 `json:"min_balance"`
-	MaxL2UnsafeHaltTime int     `json:"max_l2_unsafe_halt_time"`
+	BatchInbox          common.Address `json:"batch_inbox"`
+	L1RPC               string         `json:"l1_rpc"`
+	L2ELRPC             string         `json:"l2_el_rpc"`
+	L2CLRPC             string         `json:"l2_cl_rpc"`
+	MinBalance          float64        `json:"min_balance"`
+	MaxL2UnsafeHaltTime int            `json:"max_l2_unsafe_halt_time"`
 	// in blocks
 	MaxL2SafeDelay      int `json:"max_l2_safe_delay"`
 	MaxL2FinalizedDelay int `json:"max_l2_finalized_delay"`
@@ -72,6 +73,9 @@ func (c *Config) Check() error {
 	}
 	if c.Challenger == (common.Address{}) {
 		return errors.New("empty challenger address")
+	}
+	if c.BatchInbox == (common.Address{}) {
+		return errors.New("empty batch inbox address")
 	}
 	if c.MinBalance <= 0 {
 		return errors.New("min_balance <= 0")

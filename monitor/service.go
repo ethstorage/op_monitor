@@ -15,6 +15,9 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/dial"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -22,15 +25,16 @@ import (
 )
 
 type Service struct {
-	wg             sync.WaitGroup
-	logger         log.Logger
-	l1Client       *ethclient.Client
-	l2ELClient     *ethclient.Client
-	l2CLClient     *sources.RollupClient
-	stopped        atomic.Bool
-	shutdownCtx    context.Context
-	shutdownCancel context.CancelFunc
-	cfg            *Config
+	wg                 sync.WaitGroup
+	logger             log.Logger
+	l1Client           *ethclient.Client
+	l2ELClient         *ethclient.Client
+	l2CLClient         *sources.RollupClient
+	batchInboxContract *bind.BoundContract
+	stopped            atomic.Bool
+	shutdownCtx        context.Context
+	shutdownCancel     context.CancelFunc
+	cfg                *Config
 
 	lastEmailTime           *time.Time
 	lastSyncStatus          *eth.SyncStatus
@@ -59,6 +63,9 @@ func (s *Service) initFromCLIConfig(ctx context.Context, cfg *Config) error {
 	if err := s.initL2Client(ctx, cfg); err != nil {
 		return err
 	}
+	if err := s.initBatchInboxContract(cfg); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -83,6 +90,19 @@ func (s *Service) initL2Client(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("failed to dial L2 CL: %w", err)
 	}
 	s.l2CLClient = l2CLClient
+	return nil
+}
+
+func (s *Service) initBatchInboxContract(cfg *Config) error {
+	// ABI for balances(address) returns (uint256)
+	balancesABI := `[{"constant":true,"inputs":[{"name":"","type":"address"}],"name":"balances","outputs":[{"name":"","type":"uint256"}],"type":"function"}]`
+
+	parsedABI, err := abi.JSON(strings.NewReader(balancesABI))
+	if err != nil {
+		return fmt.Errorf("failed to parse BatchInbox ABI: %w", err)
+	}
+
+	s.batchInboxContract = bind.NewBoundContract(cfg.BatchInbox, parsedABI, s.l1Client, s.l1Client, s.l1Client)
 	return nil
 }
 
@@ -144,6 +164,14 @@ func (s *Service) monitorBalance() []string {
 		s.logger.Warn("BalanceAt failed for challenger", "err", err)
 		return nil
 	}
+
+	// Monitor batcher's balance in BatchInbox contract
+	batchInboxBalance, err := s.getBatchInboxBalance(s.cfg.Batcher)
+	if err != nil {
+		s.logger.Warn("getBatchInboxBalance failed for batcher", "err", err)
+		return nil
+	}
+
 	minBalance := big.NewInt(int64(s.cfg.MinBalance * params.Ether))
 	var alertMsg []string
 	if batcherBalance.Cmp(minBalance) <= 0 {
@@ -155,12 +183,34 @@ func (s *Service) monitorBalance() []string {
 	if challengerBalance.Cmp(minBalance) <= 0 {
 		alertMsg = append(alertMsg, fmt.Sprintf("challenger balance:%v eth, min:%v eth", toEth(challengerBalance), toEth(minBalance)))
 	}
+	if batchInboxBalance.Cmp(minBalance) <= 0 {
+		alertMsg = append(alertMsg, fmt.Sprintf("batcher balance in BatchInbox:%v eth, min:%v eth", toEth(batchInboxBalance), toEth(minBalance)))
+	}
 	return alertMsg
 }
 
 func toEth(balance *big.Int) float64 {
 	f, _ := balance.Float64()
 	return f / 1e18
+}
+
+func (s *Service) getBatchInboxBalance(account common.Address) (*big.Int, error) {
+	var result []interface{}
+	err := s.batchInboxContract.Call(&bind.CallOpts{Context: s.shutdownCtx}, &result, "balances", account)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call balances: %w", err)
+	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no result returned from balances call")
+	}
+
+	balance, ok := result[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type from balances call")
+	}
+
+	return balance, nil
 }
 
 func (s *Service) monitorHeight() []string {

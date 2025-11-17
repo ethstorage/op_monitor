@@ -21,6 +21,7 @@ $ cat config.json
     "batcher": "<batcher_address>",
     "proposer": "<proposer_address>",
     "challenger": "<challenger_address>",
+    "batch_inbox": "<inboc_address>",
     "l1_rpc": "<l1_rpc>",
     "l2_el_rpc": "<l2_el_rpc>",
     "l2_cl_rpc": "<l2_cl_rpc>",
