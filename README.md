@@ -7,8 +7,7 @@ monitor list:
 - [x] safe/finalized height of op-node doesn't halt growing
 - [x] safe/finalized height of op-node doesn't reorg
 - [x] L1 fee scalar adjustment alerts (ETH/QKC ratio change & uint32 overflow protection)
-- [ ] op-batcher/op-proposer are sending transactions in time
-- [ ] transactions from op-batcher/op-proposer doesn't fail
+- [x] op-proposer/op-challenger are sending transactions in time (via Etherscan API)
 
 
 If an alarm is triggered, an email is sent immediately. Otherwise, if no alarm occurs within 24 hours, a liveness email is sent.
@@ -37,6 +36,9 @@ $ cat config.json
     "l1_base_fee_scalar_multiplier": <l1_base_fee_scalar_multiplier>,
     "ratio_change_threshold": <ratio_change_threshold>,
     "uint32_overflow_threshold": <uint32_overflow_threshold>,
+    "etherscan_api_key": "<etherscan_api_key>",
+    "max_proposer_tx_interval": <max_proposer_tx_interval>,
+    "max_challenger_tx_interval": <max_challenger_tx_interval>,
     "email_config": {
         "server": "<smtp server>",
         "port": <port>,

@@ -37,12 +37,19 @@ type Service struct {
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
 	cfg                *Config
+	l1ChainID          uint64
 
 	lastEmailTime           *time.Time
 	lastSyncStatus          *eth.SyncStatus
 	lastUnsafeTime          *time.Time
 	lastSyncStatusCandidate *eth.SyncStatus
 	lastUnsafeTimeCandidate *time.Time
+
+	// Etherscan API rate limiting - cache last query time and results
+	lastProposerTxQueryTime   *time.Time
+	lastProposerTxTime        *time.Time
+	lastChallengerTxQueryTime *time.Time
+	lastChallengerTxTime      *time.Time
 }
 
 func ServiceFromCLIConfig(ctx context.Context, cfg *Config, logger log.Logger) (*Service, error) {
@@ -77,6 +84,15 @@ func (s *Service) initL1Client(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("failed to dial L1: %w", err)
 	}
 	s.l1Client = l1Client
+
+	// Query L1 chain ID for Etherscan v2 API
+	chainID, err := l1Client.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get L1 chain ID: %w", err)
+	}
+	s.l1ChainID = chainID.Uint64()
+	s.logger.Info("L1 chain ID", "chainID", s.l1ChainID)
+
 	return nil
 }
 
@@ -143,6 +159,7 @@ func (s *Service) monitor() {
 	alertMsg := s.monitorBalance()
 	alertMsg = append(alertMsg, s.monitorHeight()...)
 	alertMsg = append(alertMsg, s.monitorScalar()...)
+	alertMsg = append(alertMsg, s.monitorTransactions()...)
 	if len(alertMsg) > 0 {
 		s.sendEmail(strings.Join(alertMsg, "<br />"), "Alert")
 		s.promoteLastCandidate()
@@ -448,6 +465,144 @@ func (s *Service) fetchETHQKCRatio() (float64, error) {
 	// Calculate ETH/QKC ratio
 	ratio := result.Ethereum.USD / result.QuarkChain.USD
 	return ratio, nil
+}
+
+func (s *Service) monitorTransactions() []string {
+	var alertMsg []string
+
+	if s.cfg.MaxProposerTxInterval > 0 {
+		alertMsg = append(alertMsg, s.monitorAddressTx(
+			"op-proposer", s.cfg.Proposer, s.cfg.MaxProposerTxInterval,
+			&s.lastProposerTxQueryTime, &s.lastProposerTxTime)...)
+	}
+
+	if s.cfg.MaxChallengerTxInterval > 0 {
+		alertMsg = append(alertMsg, s.monitorAddressTx(
+			"op-challenger", s.cfg.Challenger, s.cfg.MaxChallengerTxInterval,
+			&s.lastChallengerTxQueryTime, &s.lastChallengerTxTime)...)
+	}
+
+	return alertMsg
+}
+
+func (s *Service) monitorAddressTx(name string, address common.Address, maxInterval int, lastQueryTime, lastTxTime **time.Time) []string {
+	var alertMsg []string
+	queryInterval := time.Duration(maxInterval/2) * time.Second
+	maxIntervalDuration := time.Duration(maxInterval) * time.Second
+
+	// Only query Etherscan if enough time has passed since last query
+	if *lastQueryTime == nil || time.Since(**lastQueryTime) >= queryInterval {
+		txTime, err := s.getLastTransactionTime(address)
+		if err != nil {
+			s.logger.Warn("getLastTransactionTime failed", "name", name, "err", err)
+			alertMsg = append(alertMsg, fmt.Sprintf("Failed to fetch %s transactions from Etherscan: %v", name, err))
+		} else {
+			// Only update lastQueryTime on first query or when we find transactions
+			// This preserves the original query time for "no transactions" alerting
+			if *lastQueryTime == nil || txTime != nil {
+				now := time.Now()
+				*lastQueryTime = &now
+			}
+			*lastTxTime = txTime
+		}
+	}
+
+	if *lastTxTime != nil {
+		elapsed := time.Since(**lastTxTime)
+		s.logger.Info("transaction monitor",
+			"name", name,
+			"lastTxTime", (**lastTxTime).Format(time.RFC3339),
+			"elapsed", elapsed.String(),
+			"maxInterval", maxIntervalDuration)
+
+		if elapsed > maxIntervalDuration {
+			// Re-fetch to avoid false alarm based on stale cache
+			txTime, err := s.getLastTransactionTime(address)
+			if err != nil {
+				s.logger.Warn("getLastTransactionTime failed", "name", name, "err", err)
+				alertMsg = append(alertMsg, fmt.Sprintf("Failed to fetch %s transactions from Etherscan: %v", name, err))
+			} else if txTime != nil {
+				now := time.Now()
+				*lastQueryTime = &now
+				*lastTxTime = txTime
+				elapsed = time.Since(*txTime)
+				if elapsed > maxIntervalDuration {
+					alertMsg = append(alertMsg, fmt.Sprintf(
+						"%s transaction interval exceeded: last tx %v ago (max %v)",
+						name, elapsed.Round(time.Second), maxIntervalDuration))
+				}
+			}
+		}
+	} else if *lastQueryTime != nil {
+		// No transactions found - alert if service has been running longer than max interval
+		elapsed := time.Since(**lastQueryTime)
+		if elapsed > maxIntervalDuration {
+			alertMsg = append(alertMsg, fmt.Sprintf(
+				"%s has no transactions found (checked %v ago, max interval %v)",
+				name, elapsed.Round(time.Second), maxIntervalDuration))
+		}
+	}
+
+	return alertMsg
+}
+
+func (s *Service) getLastTransactionTime(address common.Address) (*time.Time, error) {
+	return retry.Do(s.shutdownCtx, 3, retry.Fixed(10*time.Second), func() (*time.Time, error) {
+		return s.fetchLastTransactionTime(address)
+	})
+}
+
+func (s *Service) fetchLastTransactionTime(address common.Address) (*time.Time, error) {
+	// Query Etherscan v2 API for the latest transaction
+	url := fmt.Sprintf("https://api.etherscan.io/v2/api?chainid=%d&module=account&action=txlist&address=%s&startblock=0&endblock=99999999&page=1&offset=1&sort=desc&apikey=%s",
+		s.l1ChainID, address.Hex(), s.cfg.EtherscanAPIKey)
+
+	ctx, cancel := context.WithTimeout(s.shutdownCtx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch transactions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		Result  []struct {
+			TimeStamp string `json:"timeStamp"`
+		} `json:"result"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.Status != "1" {
+		// Status "0" with "No transactions found" is not an error
+		if result.Message == "No transactions found" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("etherscan API error: %s", result.Message)
+	}
+
+	if len(result.Result) == 0 {
+		return nil, nil
+	}
+
+	// Parse timestamp (Unix timestamp as string)
+	var timestamp int64
+	if _, err := fmt.Sscanf(result.Result[0].TimeStamp, "%d", &timestamp); err != nil {
+		return nil, fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+
+	txTime := time.Unix(timestamp, 0)
+	return &txTime, nil
 }
 
 func (s *Service) Stop(_ context.Context) error {
