@@ -6,6 +6,7 @@ monitor list:
 - [x] unsafe height of op-node doesn't reorg
 - [x] safe/finalized height of op-node doesn't halt growing
 - [x] safe/finalized height of op-node doesn't reorg
+- [x] L1 fee scalar adjustment alerts (ETH/QKC ratio change & uint32 overflow protection)
 - [ ] op-batcher/op-proposer are sending transactions in time
 - [ ] transactions from op-batcher/op-proposer doesn't fail
 
@@ -21,7 +22,7 @@ $ cat config.json
     "batcher": "<batcher_address>",
     "proposer": "<proposer_address>",
     "challenger": "<challenger_address>",
-    "batch_inbox": "<inboc_address>",
+    "batch_inbox": "<inbox_address>",
     "l1_rpc": "<l1_rpc>",
     "l2_el_rpc": "<l2_el_rpc>",
     "l2_cl_rpc": "<l2_cl_rpc>",
@@ -29,6 +30,13 @@ $ cat config.json
     "max_l2_unsafe_halt_time": <max_l2_unsafe_halt_time>,
     "max_l2_safe_delay": <max_l2_safe_delay>,
     "max_l2_finalized_delay": <max_l2_finalized_delay>,
+    "last_eth_qkc_ratio": <last_eth_qkc_ratio>,
+    "qkc_l1_blob_base_fee_scalar": <qkc_l1_blob_base_fee_scalar>,
+    "qkc_l1_base_fee_scalar": <qkc_l1_base_fee_scalar>,
+    "l1_blob_base_fee_scalar_multiplier": <l1_blob_base_fee_scalar_multiplier>,
+    "l1_base_fee_scalar_multiplier": <l1_base_fee_scalar_multiplier>,
+    "ratio_change_threshold": <ratio_change_threshold>,
+    "uint32_overflow_threshold": <uint32_overflow_threshold>,
     "email_config": {
         "server": "<smtp server>",
         "port": <port>,

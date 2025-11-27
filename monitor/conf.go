@@ -26,6 +26,15 @@ type Config struct {
 	MaxL2SafeDelay      int `json:"max_l2_safe_delay"`
 	MaxL2FinalizedDelay int `json:"max_l2_finalized_delay"`
 
+	// Scalar adjustment monitor config
+	LastETHQKCRatio               float64 `json:"last_eth_qkc_ratio"`                 // ETH/QKC ratio when scalars were last set
+	QKCL1BlobBaseFeeScalar        uint32  `json:"qkc_l1_blob_base_fee_scalar"`        // QKC chain's l1BlobBaseFeeScalar
+	QKCL1BaseFeeScalar            uint32  `json:"qkc_l1_base_fee_scalar"`             // QKC chain's l1BaseFeeScalar
+	L1BlobBaseFeeScalarMultiplier uint64  `json:"l1_blob_base_fee_scalar_multiplier"` // Multiplier for l1BlobBaseFeeScalar calculation
+	L1BaseFeeScalarMultiplier     uint64  `json:"l1_base_fee_scalar_multiplier"`      // Multiplier for l1BaseFeeScalar calculation
+	RatioChangeThreshold          float64 `json:"ratio_change_threshold"`             // Alert when ratio change exceeds this threshold (e.g., 0.1 = 10%)
+	Uint32OverflowThreshold       float64 `json:"uint32_overflow_threshold"`          // Alert when value exceeds this fraction of maxUint32 (e.g., 0.9 = 90%)
+
 	LogConfig   oplog.CLIConfig
 	EmailConfig EmailConfig `json:"email_config"`
 }
@@ -79,6 +88,30 @@ func (c *Config) Check() error {
 	}
 	if c.MinBalance <= 0 {
 		return errors.New("min_balance <= 0")
+	}
+	if c.Uint32OverflowThreshold < 0 || c.Uint32OverflowThreshold >= 1 {
+		return errors.New("uint32_overflow_threshold must be >= 0 and < 1")
+	}
+	if c.RatioChangeThreshold < 0 {
+		return errors.New("ratio_change_threshold must not be negative")
+	}
+
+	// Check for partial scalar monitor configuration
+	scalarFields := []bool{
+		c.LastETHQKCRatio != 0,
+		c.QKCL1BlobBaseFeeScalar != 0,
+		c.QKCL1BaseFeeScalar != 0,
+		c.L1BlobBaseFeeScalarMultiplier != 0,
+		c.L1BaseFeeScalarMultiplier != 0,
+	}
+	configuredCount := 0
+	for _, configured := range scalarFields {
+		if configured {
+			configuredCount++
+		}
+	}
+	if configuredCount > 0 && configuredCount < len(scalarFields) {
+		return errors.New("scalar monitor fields must be all configured or all unconfigured: last_eth_qkc_ratio, qkc_l1_blob_base_fee_scalar, qkc_l1_base_fee_scalar, l1_blob_base_fee_scalar_multiplier, l1_base_fee_scalar_multiplier")
 	}
 
 	return nil

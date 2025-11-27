@@ -2,18 +2,20 @@ package monitor
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"crypto/tls"
-
 	"github.com/ethereum-optimism/optimism/op-service/dial"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/retry"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -140,6 +142,7 @@ func (s *Service) monitor() {
 
 	alertMsg := s.monitorBalance()
 	alertMsg = append(alertMsg, s.monitorHeight()...)
+	alertMsg = append(alertMsg, s.monitorScalar()...)
 	if len(alertMsg) > 0 {
 		s.sendEmail(strings.Join(alertMsg, "<br />"), "Alert")
 		s.promoteLastCandidate()
@@ -324,6 +327,127 @@ func (s *Service) sendEmail(body, subject string) {
 		now := time.Now()
 		s.lastEmailTime = &now
 	}
+}
+
+const maxUint32 = float64(^uint32(0)) // 4294967295
+
+func (s *Service) monitorScalar() []string {
+	// Skip if scalar monitor not configured
+	if s.cfg.LastETHQKCRatio == 0 || s.cfg.QKCL1BlobBaseFeeScalar == 0 || s.cfg.QKCL1BaseFeeScalar == 0 ||
+		s.cfg.L1BlobBaseFeeScalarMultiplier == 0 || s.cfg.L1BaseFeeScalarMultiplier == 0 {
+		return nil
+	}
+
+	// Fetch latest ETH/QKC ratio (calls CoinGecko API, failure possibility is high)
+	latestRatio, err := s.getETHQKCRatio()
+	if err != nil {
+		s.logger.Warn("getETHQKCRatio failed", "err", err)
+		return []string{fmt.Sprintf("Failed to fetch ETH/QKC ratio (CoinGecko API may be unavailable): %v", err)}
+	}
+
+	// Calculate ratio change percentage (absolute value)
+	ratioChange := (latestRatio - s.cfg.LastETHQKCRatio) / s.cfg.LastETHQKCRatio
+	if ratioChange < 0 {
+		ratioChange = -ratioChange
+	}
+
+	// Calculate: ETH/QKC ratio × QKC scalar × 1.5 / multiplier
+	blobMultiplier := s.cfg.L1BlobBaseFeeScalarMultiplier
+	baseMultiplier := s.cfg.L1BaseFeeScalarMultiplier
+
+	latestBlobValue := uint32(latestRatio * float64(s.cfg.QKCL1BlobBaseFeeScalar) * 1.5 / float64(blobMultiplier))
+	latestBaseValue := uint32(latestRatio * float64(s.cfg.QKCL1BaseFeeScalar) * 1.5 / float64(baseMultiplier))
+
+	s.logger.Info("scalar monitor",
+		"latestETHQKCRatio", latestRatio,
+		"lastETHQKCRatio", s.cfg.LastETHQKCRatio,
+		"ratioChange", fmt.Sprintf("%.2f%%", ratioChange*100),
+		"threshold", fmt.Sprintf("%.2f%%", s.cfg.RatioChangeThreshold*100),
+		"qkcBlobScalar", s.cfg.QKCL1BlobBaseFeeScalar,
+		"qkcBaseScalar", s.cfg.QKCL1BaseFeeScalar,
+		"latestBlobValue", latestBlobValue,
+		"latestBaseValue", latestBaseValue)
+
+	var alertMsg []string
+
+	// Check if latest values would exceed threshold of uint32 max
+	if s.cfg.Uint32OverflowThreshold > 0 {
+		overflowThreshold := uint32(maxUint32 * s.cfg.Uint32OverflowThreshold)
+		if latestBlobValue > overflowThreshold {
+			alertMsg = append(alertMsg, fmt.Sprintf(
+				"l1BlobBaseFeeScalar near overflow: %d (= %.4f × %d × 1.5 / %d) > %.0f%% of max uint32 (%d)",
+				latestBlobValue, latestRatio, s.cfg.QKCL1BlobBaseFeeScalar, blobMultiplier,
+				s.cfg.Uint32OverflowThreshold*100, overflowThreshold))
+		}
+
+		if latestBaseValue > overflowThreshold {
+			alertMsg = append(alertMsg, fmt.Sprintf(
+				"l1BaseFeeScalar near overflow: %d (= %.4f × %d × 1.5 / %d) > %.0f%% of max uint32 (%d)",
+				latestBaseValue, latestRatio, s.cfg.QKCL1BaseFeeScalar, baseMultiplier,
+				s.cfg.Uint32OverflowThreshold*100, overflowThreshold))
+		}
+	}
+
+	// Alert if ratio change exceeds threshold
+	if ratioChange > s.cfg.RatioChangeThreshold {
+		lastBlobValue := uint32(s.cfg.LastETHQKCRatio * float64(s.cfg.QKCL1BlobBaseFeeScalar) * 1.5 / float64(blobMultiplier))
+		lastBaseValue := uint32(s.cfg.LastETHQKCRatio * float64(s.cfg.QKCL1BaseFeeScalar) * 1.5 / float64(baseMultiplier))
+
+		blobPctOfMax := float64(latestBlobValue) / maxUint32 * 100
+		basePctOfMax := float64(latestBaseValue) / maxUint32 * 100
+
+		alertMsg = append(alertMsg, fmt.Sprintf(
+			"Scalar adjustment needed (ratio change %.2f%% > threshold %.2f%%): "+
+				"l1BlobBaseFeeScalar: latest(%d, %.4f%% of maxUint32) vs last(%d), "+
+				"l1BaseFeeScalar: latest(%d, %.4f%% of maxUint32) vs last(%d)",
+			ratioChange*100, s.cfg.RatioChangeThreshold*100,
+			latestBlobValue, blobPctOfMax, lastBlobValue,
+			latestBaseValue, basePctOfMax, lastBaseValue))
+	}
+
+	return alertMsg
+}
+
+func (s *Service) getETHQKCRatio() (float64, error) {
+	return retry.Do(s.shutdownCtx, 3, retry.Fixed(10*time.Second), func() (float64, error) {
+		return s.fetchETHQKCRatio()
+	})
+}
+
+func (s *Service) fetchETHQKCRatio() (float64, error) {
+	// Use CoinGecko API to get ETH and QKC prices in USD, then calculate ratio
+	url := "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,quark-chain&vs_currencies=usd"
+
+	ctx, cancel := context.WithTimeout(s.shutdownCtx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch price: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Ethereum   struct{ USD float64 `json:"usd"` } `json:"ethereum"`
+		QuarkChain struct{ USD float64 `json:"usd"` } `json:"quark-chain"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.QuarkChain.USD == 0 {
+		return 0, fmt.Errorf("QKC price is zero")
+	}
+
+	// Calculate ETH/QKC ratio
+	ratio := result.Ethereum.USD / result.QuarkChain.USD
+	return ratio, nil
 }
 
 func (s *Service) Stop(_ context.Context) error {
