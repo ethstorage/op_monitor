@@ -35,6 +35,11 @@ type Config struct {
 	RatioChangeThreshold          float64 `json:"ratio_change_threshold"`             // Alert when ratio change exceeds this threshold (e.g., 0.1 = 10%)
 	Uint32OverflowThreshold       float64 `json:"uint32_overflow_threshold"`          // Alert when value exceeds this fraction of maxUint32 (e.g., 0.9 = 90%)
 
+	// Transaction submission monitor config (uses Etherscan v2 API)
+	EtherscanAPIKey         string `json:"etherscan_api_key"`          // Etherscan API key for querying transactions
+	MaxProposerTxInterval   int    `json:"max_proposer_tx_interval"`   // Max seconds between proposer transactions
+	MaxChallengerTxInterval int    `json:"max_challenger_tx_interval"` // Max seconds between challenger transactions (0 to disable)
+
 	LogConfig   oplog.CLIConfig
 	EmailConfig EmailConfig `json:"email_config"`
 }
@@ -112,6 +117,14 @@ func (c *Config) Check() error {
 	}
 	if configuredCount > 0 && configuredCount < len(scalarFields) {
 		return errors.New("scalar monitor fields must be all configured or all unconfigured: last_eth_qkc_ratio, qkc_l1_blob_base_fee_scalar, qkc_l1_base_fee_scalar, l1_blob_base_fee_scalar_multiplier, l1_base_fee_scalar_multiplier")
+	}
+
+	// Check for partial transaction monitor configuration
+	txMonitorEnabled := c.MaxProposerTxInterval > 0 || c.MaxChallengerTxInterval > 0
+	if txMonitorEnabled {
+		if c.EtherscanAPIKey == "" {
+			return errors.New("etherscan_api_key is required when transaction monitoring is enabled")
+		}
 	}
 
 	return nil
