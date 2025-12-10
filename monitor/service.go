@@ -50,6 +50,9 @@ type Service struct {
 	lastProposerTxTime        *time.Time
 	lastChallengerTxQueryTime *time.Time
 	lastChallengerTxTime      *time.Time
+
+	// Scalar monitor - only check once per day
+	lastScalarCheckTime *time.Time
 }
 
 func ServiceFromCLIConfig(ctx context.Context, cfg *Config, logger log.Logger) (*Service, error) {
@@ -355,12 +358,21 @@ func (s *Service) monitorScalar() []string {
 		return nil
 	}
 
+	// Only check once per day to avoid CoinGecko rate limiting
+	if s.lastScalarCheckTime != nil && time.Since(*s.lastScalarCheckTime) < 24*time.Hour {
+		return nil
+	}
+
 	// Fetch latest ETH/QKC ratio (calls CoinGecko API, failure possibility is high)
 	latestRatio, err := s.getETHQKCRatio()
 	if err != nil {
 		s.logger.Warn("getETHQKCRatio failed", "err", err)
 		return []string{fmt.Sprintf("Failed to fetch ETH/QKC ratio (CoinGecko API may be unavailable): %v", err)}
 	}
+
+	// Update last check time after successful API call
+	now := time.Now()
+	s.lastScalarCheckTime = &now
 
 	// Calculate ratio change percentage (absolute value)
 	ratioChange := (latestRatio - s.cfg.LastETHQKCRatio) / s.cfg.LastETHQKCRatio
